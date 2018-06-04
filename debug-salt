@@ -104,7 +104,6 @@ for my $orch ( @orchlist ) {
   
   # Regenerate line number tracking for correlations
   my $lno = $orch->{'lno'};
-  #print "orch lno: $lno\n";
   my $coder_state = { buffer => '', line => $lno, level => 0 };
   encode_item( $coder_state, $ob );
   
@@ -149,11 +148,12 @@ sub process_fh {
   
   print $ofh "[\n";
   
+  my $is_first_chunk = 1;
   while( my $line = <$fh> ) {
     $in = 1 if( $line =~ m/^  <row>$/ );
     $buffer .= "$line\n" if( $in );
 
-    if( $line =~ m/^  <\/row>$/ ) {
+    if( $in && $line =~ m/^  <\/row>$/ ) {
       $in = 0;
       
       my ( $xob, $row ) = XML::Bare->simple( text => $buffer );
@@ -164,27 +164,37 @@ sub process_fh {
       my $fun = $ob->{'fun'} || '';
         
       my $chunk;
+      if( $is_first_chunk ) {
+        $is_first_chunk = 0;
+      }
+      else {
+        $chunk .= ",";
+      }
       if( $fun eq 'runner.state.orchestrate' ) {
         # encode_item advances the 'line' variable within $coder_state
         my $start_lno = $coder_state->{'line'};
         encode_item( $coder_state, $ob );
-        $chunk = $coder_state->{'buffer'};
+        $chunk .= $coder_state->{'buffer'};
         delete $coder_state->{'buffer'};
+        
         #process_orchestrate_row( $ob, $rfh );
+        # Instead of processing orchestration rows immediately we are keeping tracking of where it is
+        # within the output JSON and will process it after all JSON has been output. This is done in
+        # order to ensure that the JSON conversion finishes regardless of the stability or lack thereof
+        # of the orchestration parsing.
+        # The position and length is altered just a bit to drop the comma between chunks.
         push( @orchlist, {
             lno => $start_lno,
-            start => tell( $ofh ),
-            len => length( $chunk )
+            start => tell( $ofh ) + ( $is_first_chunk ? 0 : 1 ),
+            len => length( $chunk ) - ( $is_first_chunk ? 0 : 1 )
         } );
       }
       else {
-        $chunk = $coder->encode( $ob );
+        $chunk .= $coder->encode( $ob );
         # Advance the tracked line number by the number of lines that will be appended
         
         my $lines = 0;
         while( $chunk =~ m/\n/g ) { $lines++; }
-        #my $lines = () = $chunk =~ m/\Q\n/g;
-        #print "Lines: $lines\n";
         
         $coder_state->{'line'} += $lines;
       }
@@ -192,18 +202,16 @@ sub process_fh {
       process_grains_items_row( $ob ) if( $fun eq 'grains.items' );
       process_state_sls_row( $ob)     if( $fun eq 'state.sls' );
       
-      chop( $chunk );
-      $chunk .= ",\n";
       print $ofh $chunk;
 
       $buffer = '';
     }
   }
   
-  print $ofh "0]\n";
+  print $ofh "]\n";
   
-  # Note that above process will leave a structure similar to this:
-  # [ {...},{...},0 ]
+  # The above process will leave a structure similar to this:
+  # [ {...}\n,{...}\n,{...}\n ]
   
   close( $fh );
 }
@@ -405,7 +413,9 @@ sub dump_nodes {
   my @nodes = keys %$data;
   return if( !@nodes );
   
+  # $node is the host/server node being acted on by salt
   for my $node ( @nodes ) {
+    my $node_out = {};
     my $serverData = $data->{$node};
     next if( !$serverData || !ref( $serverData ) || ref($serverData) ne 'HASH' || !%$serverData );
     my @evNames = keys %$serverData;
@@ -417,6 +427,8 @@ sub dump_nodes {
     
     my @rows;
     my @valid_names;
+    # First go through all the events adding a 'sort' column so that the
+    # main events can be kept in a reasonable sorted order.
     for my $evName ( @evNames ) {
       my $ev = $serverData->{$evName};
       next if( !$ev || !ref( $ev ) || ref( $ev ) ne 'HASH' );
@@ -470,6 +482,8 @@ sub dump_nodes {
         }
       }
       
+      # Event "names" are a series of parameters combined together by "_|-"
+      # Each event name has 4 such parameters; the following decodes that info
       if( $evName =~ m/(.+)\_\|\-(.+)\_\|\-(.+)\_\|\-(.+)/ ) {
         my $evType = $1;
         my $a1 = $2;
@@ -489,51 +503,54 @@ sub dump_nodes {
           }
         }
         else {
+          # Sometimes the second and third paremters are equal; no point printing them out twice
           if( $a1 eq $a2 ) {
             if( $level == 2 ) {
               push( @rows, [ $evinfo, "#$lno", $evType, $evVariant, $a1 ] );
             }
             else {
-              print $rfh "${dent}$evType-$evVariant\t\t$a1\n";
+              my $lno = $ev->{'!line'} || '?';
+              print $rfh "${dent}#$lno $evType-$evVariant\t$a1\t$a2\n";
             }
           }
           else {
             if( $level == 2 ) {
               push( @rows, [ $evinfo, "#$lno", $evType, $evVariant, $a1, $a2 ] );
-              my $changes = $ev->{'changes'};
-              if( $changes ) {
-                if( !ref( $changes ) ) {
-                  $changes = [ $changes ];
-                }
-                my $showok = 0;
-                if( ref( $changes ) eq 'HASH' ) {
-                  $showok = 1;
-                  my $arr = [];
-                  for my $key ( keys %$changes ) {
-                    next if( $key =~ m/^!/ );
-                    my $val = $changes->{ $key };
-                    if( $key eq 'diff' && $val =~ m/---.+/ ) {
-                      $val = 'contents...';
-                    }
-                    my $show = 1;
-                    $show = 0 if( $val =~ m/^\s*$/ );
-                    $show = 0 if( $key eq 'retcode' && $val eq '0' );
-                    $show = 0 if( $key eq 'pid' );
-                    $show = 0 if( $key eq 'stderr' && $val =~ m/% Total/ );
-                    push( @$arr, "$key: $val" ) if( $show );
-                  }
-                  $changes = $arr;
-                }
-                if( @$changes ) {
-                  push( @rows, [ { join => 1 }, @$changes ] );
-                } elsif( $showok ) {
-                  push( @rows, [ {}, 'ok' ] );
-                }
-              }
             }
             else {
               my $lno = $ev->{'!line'} || '?';
               print $rfh "${dent}#$lno $evType-$evVariant\t$a1\t$a2\n";
+            }
+          }
+          
+          my $changes = $ev->{'changes'};
+          if( $changes ) {
+            if( !ref( $changes ) ) {
+              $changes = [ $changes ];
+            }
+            my $showok = 0;
+            if( ref( $changes ) eq 'HASH' ) {
+              $showok = 1;
+              my $arr = [];
+              for my $key ( keys %$changes ) {
+                next if( $key =~ m/^!/ );
+                my $val = $changes->{ $key };
+                if( $key eq 'diff' && $val =~ m/---.+/ ) {
+                  $val = 'contents...';
+                }
+                my $show = 1;
+                $show = 0 if( $val =~ m/^\s*$/ );
+                $show = 0 if( $key eq 'retcode' && $val eq '0' );
+                $show = 0 if( $key eq 'pid' );
+                $show = 0 if( $key eq 'stderr' && $val =~ m/% Total/ );
+                push( @$arr, "$key: $val" ) if( $show );
+              }
+              $changes = $arr;
+            }
+            if( @$changes ) {
+              push( @rows, [ { join => 1 }, @$changes ] );
+            } elsif( $showok ) {
+              push( @rows, [ {}, 'ok' ] );
             }
           }
           next;
