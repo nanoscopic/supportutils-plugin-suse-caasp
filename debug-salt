@@ -225,11 +225,11 @@ sub db_cmd {
   my $pass_param = "--password=\"\$(cat $db_pass_path)\"";
   
   if( $mode eq 'dev' ) {
-    my $pod_id = cmd_on_domain( 'admin', 'docker ps -f name=mariadb --format "{{.ID}}"', 0 );
+    my $pod_id = cmd_on_domain( 'admin0', 'docker ps -f name=mariadb --format "{{.ID}}"', 0 );
     chomp $pod_id;
     #print "MariaDB pod id: $pod_id\n";
     my $cmd = "docker exec $pod_id mysql -u velum $pass_param -e \"$db_cmd\" -X";
-    return cmd_on_domain( 'admin', $cmd, $filename );
+    return cmd_on_domain( 'admin0', $cmd, $filename );
   }
   elsif( $mode eq 'admin' ) {
     my $pod_id = `docker ps -f name=mariadb --format "{{.ID}}"`;
@@ -245,8 +245,46 @@ sub db_cmd {
 sub cmd_on_domain {
   my ( $domain, $cmd, $filename ) = @_;
   
-  my $dn = "devenv.caasp.suse.net";
-  my $ssh_base = "ssh -F environment.ssh_config root\@$domain.$dn";
+  #my $dn = "devenv.caasp.suse.net";
+  my $ssh_base;
+  
+  # If we are running from a directory with an ssh_config file, use that
+  if( -e "environment.ssh_config" ) {
+    $ssh_base = "ssh -F environment.ssh_config root\@$domain";#.$dn";
+  }
+  
+  # If the user has configured ssh already to use a 'id_shared' identityfile, use that
+  else {
+    my $identLine = `ssh -G root\@$domain | grep identityfile`;#.$dn
+    # If we get an ident line back then ssh is already configured by the user to have the proper auth
+    if( $identLine =~ m/id_shared/ ) {
+      $ssh_base = "ssh root\@$domain";
+    }
+  }
+  
+  # In worst case scenario, analyze the virsh admin domain and find the automation repo directory
+  # used to build it, then use the created ssh_config file located there.
+  if( !$ssh_base ) {
+    my $adminConf = `virsh dumpxml admin`;
+    my ( $ob, $xml ) = XML::Bare->simple( text => $adminConf );
+    my $filesystems = $xml->{'domain'}{'devices'}{'filesystem'};
+    for my $fs ( @$filesystems ) {
+      if( $fs->{'type'} eq 'mount' && $fs->{'accessmode'} eq 'mapped' && $fs->{'source'} ) {
+        my $sourceDir = $fs->{'source'}{'dir'};
+        if( $sourceDir && $sourceDir =~ m|(.+/automation)/caasp-kvm/| ) {
+          my $automationDir = $1;
+          my $envDir = "$automationDir/misc-tools";
+          $ssh_base = "ssh -F \"$envDir/environment.ssh_config\" root\@$domain";
+        }
+      }
+    }
+  }
+  
+  # If we failed to find credentials to reach the admin domain, output a message telling the user to run it from a directory
+  # containing ssh_config. There are other ways, but this will at least give the user some info they can act on.
+  if( !$ssh_base ) {
+    die "When using dev mode, debug-salt should be run from the directory containing environment.ssh_config ( ~/github/automation/misc-tools )";
+  }
   if( !$filename ) {
     return `$ssh_base '$cmd' 2>/dev/null`;
   }
